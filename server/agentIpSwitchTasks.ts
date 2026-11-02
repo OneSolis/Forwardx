@@ -10,7 +10,7 @@ export const ipSwitchResultSchema = z.object({
   httpStatus: z.number().int().min(0).max(599).optional(), newIp: z.string().max(64).optional(),
 }).strict();
 export type IpSwitchAgentResult = z.infer<typeof ipSwitchResultSchema>;
-export type IpSwitchAgentTask = { taskId: string; serviceId: number; expiresAt: number; request: IpSwitchHook };
+export type IpSwitchAgentTask = { taskId: string; serviceId: number; expectedIp: string; expiresAt: number; request: IpSwitchHook };
 type Pending = { taskId: string; serviceId: number; expectedIp: string; expiresAt: number; task?: IpSwitchAgentTask; delivered: boolean; claimStarted: boolean; claimed: boolean; resolve: (result: IpSwitchAgentResult) => void; timer: ReturnType<typeof setTimeout> };
 const capabilities = new Map<number, number>();
 const pending = new Map<number, Pending>();
@@ -20,10 +20,14 @@ export function recordIpSwitchAgentCapability(hostId: number, supported: unknown
 }
 export function ipSwitchAgentReady(hostId: number) { return Date.now() - (capabilities.get(hostId) || 0) < 300000; }
 export class IpSwitchNotDispatchedError extends Error {}
-export function enqueueIpSwitchAgentTask(hostId: number, input: Omit<IpSwitchAgentTask, "expiresAt"> & { expectedIp: string }, timeoutMs = 120000): Promise<IpSwitchAgentResult> {
+// The claim window covers a full idle heartbeat interval, so a task queued just
+// after one heartbeat can still be delivered. The pending entry outlives the claim
+// window, the provider timeout, the 10 s settle wait and the public-IP lookup, while
+// staying below the 150 s manual acknowledgement gate.
+export function enqueueIpSwitchAgentTask(hostId: number, input: Omit<IpSwitchAgentTask, "expiresAt">, timeoutMs = 145000): Promise<IpSwitchAgentResult> {
   if (!ipSwitchAgentReady(hostId) || pending.has(hostId)) throw new IpSwitchNotDispatchedError("agent_unavailable");
   return new Promise(resolve => {
-    const expiresAt = Math.ceil((panelCryptoNowMs() + Math.min(timeoutMs, 60000)) / 1000);
+    const expiresAt = Math.ceil((panelCryptoNowMs() + Math.min(timeoutMs, 90000)) / 1000);
     const timer = setTimeout(() => {
       const current = pending.get(hostId);
       if (current?.taskId !== input.taskId) return;
@@ -31,7 +35,8 @@ export function enqueueIpSwitchAgentTask(hostId: number, input: Omit<IpSwitchAge
       resolve({ taskId: input.taskId, outcome: current.delivered ? "uncertain" : "not_executed", reason: "expired" });
     }, timeoutMs);
     timer.unref?.();
-    pending.set(hostId, { taskId: input.taskId, serviceId: input.serviceId, expectedIp: input.expectedIp, task: { taskId: input.taskId, serviceId: input.serviceId, request: input.request, expiresAt }, expiresAt, delivered: false, claimStarted: false, claimed: false, resolve, timer });
+    const task: IpSwitchAgentTask = { taskId: input.taskId, serviceId: input.serviceId, expectedIp: input.expectedIp, request: input.request, expiresAt };
+    pending.set(hostId, { taskId: input.taskId, serviceId: input.serviceId, expectedIp: input.expectedIp, task, expiresAt, delivered: false, claimStarted: false, claimed: false, resolve, timer });
     console.info(`[ChinaHealth] host=${hostId} service=${input.serviceId} task=${input.taskId} stage=queued 换 IP 任务已排队，等待 Agent 领取；尚未请求商家接口`);
     pushAgentRefresh(hostId, "china-health-ip-switch");
   });

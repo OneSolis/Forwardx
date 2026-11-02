@@ -164,7 +164,11 @@ async function performSwitch(row: any, service: any, host: any, state: ChinaHeal
       }
       newIp = await verifyIpSwitchResponse(hook, response, expectedIp);
       status = response.outcome === "accepted" ? "accepted" : "succeeded";
-      message = response.outcome === "accepted" ? "商家接口已接收请求（HTTP 2xx），实际换 IP 结果以后续探测或商家状态为准" : "商家接口确认换 IP 请求成功，等待后续探测恢复";
+      message = response.outcome === "accepted"
+        ? "商家接口已接收请求（HTTP 2xx），实际换 IP 结果以后续探测或商家状态为准"
+        : hook.successMode === "http"
+          ? `已等待 10 秒并通过 ip.sb 核对到新公网 IP${newIp ? ` ${newIp}` : ""}，等待后续探测恢复`
+          : "商家接口确认换 IP 请求成功，等待后续探测恢复";
       if (newIp && hook.updateAddress !== "none") {
         const current = await db.getHostById(host.id);
         if (current && hostIngressAddress(current) === expectedIp) {

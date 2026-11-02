@@ -446,3 +446,80 @@ func TestIPSwitchReadAndBuildFailureDiagnostics(t *testing.T) {
 		t.Fatalf("incorrect request build diagnostic: %s", logged)
 	}
 }
+
+func TestIPSwitchVerificationAfterProviderResult(t *testing.T) {
+	task := sampleIPSwitchTask()
+	task.ExpectedIP = "1.1.1.1"
+	accepted := ipSwitchResult{TaskID: task.TaskID, Outcome: "accepted", Reason: "ok"}
+	waits := 0
+	wait := func(delay time.Duration) {
+		waits++
+		if delay != ipSwitchVerifyDelay {
+			t.Fatalf("unexpected verify delay: %s", delay)
+		}
+	}
+	lookup := func(value string, err error) func() (string, error) {
+		return func() (string, error) { return value, err }
+	}
+	if result := verifyIPSwitchNewIP(task, accepted, wait, lookup("8.8.4.4\n", nil)); result.Outcome != "verified" || result.Reason != "ok" || result.NewIP != "8.8.4.4" || waits != 1 {
+		t.Fatalf("new public address not verified: %+v", result)
+	}
+	jsonIP := parseIPSwitchPublicIP([]byte(`{"ip":"8.8.4.4"}`))
+	if jsonIP == nil {
+		t.Fatal("JSON public address not parsed")
+	}
+	if result := verifyIPSwitchNewIP(task, accepted, wait, lookup(jsonIP.String(), nil)); result.Outcome != "verified" || result.NewIP != "8.8.4.4" {
+		t.Fatalf("JSON public address not verified: %+v", result)
+	}
+	if result := verifyIPSwitchNewIP(task, accepted, wait, lookup("1.1.1.1", nil)); result.Outcome != "uncertain" || result.Reason != "invalid_ip" || result.NewIP != "" {
+		t.Fatalf("unchanged public address accepted: %+v", result)
+	}
+	for _, tc := range []struct {
+		value string
+		err   error
+	}{
+		{"", errors.New("lookup unavailable")},
+		{"<html>not an address</html>", nil},
+		{"10.0.0.2", nil},
+		{"127.0.0.1", nil},
+	} {
+		result := verifyIPSwitchNewIP(task, accepted, wait, lookup(tc.value, tc.err))
+		if result.Outcome != "accepted" || result.Reason != "ok" || result.NewIP != "" {
+			t.Fatalf("unusable lookup changed the provider result: %+v", result)
+		}
+	}
+	verified := ipSwitchResult{TaskID: task.TaskID, Outcome: "verified", Reason: "ok", NewIP: "8.8.4.4"}
+	if result := verifyIPSwitchNewIP(task, verified, wait, lookup("9.9.9.9", nil)); result.Outcome != "verified" || result.NewIP != "8.8.4.4" {
+		t.Fatalf("provider address must stay authoritative: %+v", result)
+	}
+	legacy := task
+	legacy.ExpectedIP = ""
+	lookups := 0
+	if result := verifyIPSwitchNewIP(legacy, accepted, func(time.Duration) { t.Fatal("legacy task must not wait") }, func() (string, error) { lookups++; return "8.8.4.4", nil }); result.Outcome != "accepted" || lookups != 0 {
+		t.Fatalf("legacy panel result changed: %+v", result)
+	}
+	if result := verifyIPSwitchNewIP(task, ipSwitchResult{TaskID: task.TaskID, Outcome: "uncertain", Reason: "http_status"}, func(time.Duration) { t.Fatal("failed provider request must not wait") }, lookup("8.8.4.4", nil)); result.Outcome != "uncertain" {
+		t.Fatalf("failed provider request changed: %+v", result)
+	}
+}
+
+func TestIPSwitchPublicIPResponseFormats(t *testing.T) {
+	for _, tc := range []struct {
+		body string
+		want string
+	}{
+		{"8.8.4.4\n", "8.8.4.4"},
+		{" 2606:4700:4700::1111 \n", "2606:4700:4700::1111"},
+		{`{"ip":"8.8.4.4"}`, "8.8.4.4"},
+		{"<html>no address</html>", ""},
+		{"8.8.4.4 9.9.9.9", ""},
+	} {
+		got := ""
+		if ip := parseIPSwitchPublicIP([]byte(tc.body)); ip != nil {
+			got = ip.String()
+		}
+		if got != tc.want {
+			t.Fatalf("parse %q = %q, want %q", tc.body, got, tc.want)
+		}
+	}
+}

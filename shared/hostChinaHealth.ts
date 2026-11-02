@@ -77,7 +77,7 @@ export const ipSwitchReasonLabels: Record<string, string> = {
   state_unavailable: "Agent 无法保存防重复标记", claim_denied: "执行前配置或主机状态已变化",
   request_failed: "商家接口连接失败或超时", http_status: "商家接口返回非 2xx 状态",
   invalid_response: "商家返回的内容不是有效 JSON", success_mismatch: "商家返回值与成功条件不匹配",
-  invalid_ip: "商家返回的新 IP 无效", agent_unavailable: "Agent 暂不可用",
+  invalid_ip: "新 IP 无效或未生效", agent_unavailable: "Agent 暂不可用",
 };
 export const ipSwitchBlockedLabels: Record<string, string> = {
   agent_unavailable: "等待 Agent 上报换 IP 能力", unresolved: "等待核对上次商家结果",
