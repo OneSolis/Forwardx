@@ -5109,7 +5109,7 @@
   "批量重启": "Bulk restart",
   "批量删除": "Bulk delete",
   "商家换 IP 间隔（分钟）": "Provider IP change interval (minutes)",
-  "可能收费或重启；已接收或结果不明的请求不自动重试。": "May incur fees or reboot; accepted or uncertain requests are never retried automatically.",
+  "可能收费或重启；结果不明或新 IP 仍不可用时，会在商家请求间隔结束后自动继续尝试。": "May incur fees or reboot; uncertain results or a still-blocked IP are retried after the provider interval.",
   "商家换 IP 间隔默认 60 分钟，请按商家限制配置。同一主机共用请求历史，重启或重新添加服务不会清空间隔；明确未执行的任务可在间隔结束后重试。": "The provider interval defaults to 60 minutes. Set it to your provider's limit. Services on the same host share history across restarts and recreation. Tasks confirmed not executed may retry after the interval.",
   "等待 Agent 上报换 IP 能力": "Waiting for the Agent to report IP change support",
   "等待核对上次商家结果": "Waiting for verification of the previous provider result",

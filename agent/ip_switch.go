@@ -24,10 +24,12 @@ const (
 	// Give the provider-side change time to take effect before reading the
 	// public egress address. The panel sends expectedIp only when it accepts
 	// a verified outcome for HTTP-mode hooks; older panels keep the provider result.
-	ipSwitchVerifyDelay   = 10 * time.Second
-	ipSwitchVerifyTimeout = 10 * time.Second
-	ipSwitchVerifyURL     = "https://ip.sb"
-	ipSwitchVerifyLimit   = 4096
+	ipSwitchVerifyDelay      = 10 * time.Second
+	ipSwitchVerifyTimeout    = 10 * time.Second
+	ipSwitchVerifyURL        = "https://ip.sb"
+	ipSwitchVerifyLimit      = 4096
+	ipSwitchReportRetryDelay = 5 * time.Second
+	ipSwitchReportWindow     = 55 * time.Second
 )
 
 type ipSwitchRequest struct {
@@ -254,7 +256,24 @@ func parseIPSwitchPublicIP(body []byte) net.IP {
 // lookupIPSwitchPublicIP reads the public egress address of this Agent host.
 // The dedicated client keeps the same no-proxy, no-redirect and address rules
 // as the provider request client.
+// lookupIPSwitchPublicIP reads the public egress address, retrying briefly
+// because the provider may reset networking while applying the new address.
 func lookupIPSwitchPublicIP() (string, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		value, err := lookupIPSwitchPublicIPOnce()
+		if err == nil {
+			return value, nil
+		}
+		lastErr = err
+		if attempt < 2 {
+			time.Sleep(3 * time.Second)
+		}
+	}
+	return "", lastErr
+}
+
+func lookupIPSwitchPublicIPOnce() (string, error) {
 	client := newIPSwitchClient(ipSwitchVerifyTimeout)
 	defer client.CloseIdleConnections()
 	req, err := http.NewRequest(http.MethodGet, ipSwitchVerifyURL, nil)
@@ -520,23 +539,50 @@ func handleIPSwitchTask(cfg Config, task ipSwitchTask) {
 	})
 	// Only fixed enums/IDs are logged; neither provider responses nor credentials.
 	logIPSwitchTask(task, "outcome=%s reason=%s status=%d durationMs=%d", result.Outcome, result.Reason, result.HTTPStatus, time.Since(started).Milliseconds())
-	reportIPSwitchResult(task, result, func(result ipSwitchResult, ack *ipSwitchReportAck) error {
+	panelNow := encryptedResponseNow(currentPanelURL(cfg))
+	reportDeadline := time.Now().Add(time.Unix(task.ExpiresAt, 0).Add(ipSwitchReportWindow).Sub(panelNow))
+	reportIPSwitchResultWithRetry(task, result, func(result ipSwitchResult, ack *ipSwitchReportAck) error {
 		return post(cfg, "/api/agent/ip-switch-result", map[string]any{"result": result}, ack)
-	})
+	}, time.Sleep, reportDeadline)
 }
 
 type ipSwitchReportAck struct {
 	Success bool `json:"success"`
 }
 
-func reportIPSwitchResult(task ipSwitchTask, result ipSwitchResult, report func(ipSwitchResult, *ipSwitchReportAck) error) {
+func reportIPSwitchResultAttempt(task ipSwitchTask, result ipSwitchResult, report func(ipSwitchResult, *ipSwitchReportAck) error) bool {
 	logIPSwitchTask(task, "stage=result_report_started 开始回传换 IP 结果")
 	var ack ipSwitchReportAck
 	if err := report(result, &ack); err != nil {
 		logIPSwitchTask(task, "stage=result_report_failed error=%s 换 IP 结果回传失败，不会重复请求商家接口", ipSwitchErrorCategory(err))
-	} else if !ack.Success {
+		return true
+	}
+	if !ack.Success {
 		logIPSwitchTask(task, "stage=result_report_rejected 面板未接收该结果，请检查任务是否过期或已结束；不会重复请求商家接口")
-	} else {
-		logIPSwitchTask(task, "stage=result_reported 换 IP 结果已回传面板")
+		return false
+	}
+	logIPSwitchTask(task, "stage=result_reported 换 IP 结果已回传面板")
+	return false
+}
+
+func reportIPSwitchResult(task ipSwitchTask, result ipSwitchResult, report func(ipSwitchResult, *ipSwitchReportAck) error) {
+	reportIPSwitchResultAttempt(task, result, report)
+}
+
+// The provider may reset networking while applying a new address, so the
+// result POST can fail after the paid request already succeeded. Retry only
+// the report until shortly before the panel stops accepting the result; a
+// rejected result is final because the panel no longer knows the task.
+func reportIPSwitchResultWithRetry(task ipSwitchTask, result ipSwitchResult, report func(ipSwitchResult, *ipSwitchReportAck) error, sleep func(time.Duration), deadline time.Time) {
+	for attempt := 1; ; attempt++ {
+		if !reportIPSwitchResultAttempt(task, result, report) {
+			return
+		}
+		if !time.Now().Add(ipSwitchReportRetryDelay).Before(deadline) {
+			logIPSwitchTask(task, "stage=result_report_failed attempts=%d 结果回传重试窗口结束，不会重复请求商家接口", attempt)
+			return
+		}
+		logIPSwitchTask(task, "stage=result_report_retry attempt=%d 面板连接暂不可用，等待后重试结果回传", attempt)
+		sleep(ipSwitchReportRetryDelay)
 	}
 }

@@ -92,7 +92,7 @@ export default function HostChinaHealthSettings({ value, onChange, hookLoading =
       ] as const).map(([key, label, min, max]) => <div className="space-y-1" key={key}><Label className="text-xs" htmlFor={`china-${key}`}>{t(label)}</Label><Input className="h-9 sm:h-8" id={`china-${key}`} type="number" min={min} max={max} value={key === "cooldownSeconds" ? value[key] / 60 : value[key]} onChange={event => patch({ [key]: key === "cooldownSeconds" ? Math.round(Number(event.target.value) * 60) : Number(event.target.value) })} /></div>)}</div>
       <Label className="flex items-center justify-between gap-3">{t("通知管理员")}<Switch checked={value.notify} onCheckedChange={notify => patch({ notify })} /></Label>
       <Label className="flex items-center justify-between gap-3">{t("自动切换 IP")}<Switch checked={value.autoSwitch} onCheckedChange={autoSwitch => patch({ autoSwitch })} /></Label>
-      {value.autoSwitch && <p className="text-xs text-muted-foreground">{t("可能收费或重启；已接收或结果不明的请求不自动重试。")}</p>}
+      {value.autoSwitch && <p className="text-xs text-muted-foreground">{t("可能收费或重启；结果不明或新 IP 仍不可用时，会在商家请求间隔结束后自动继续尝试。")}</p>}
       {hookLoading && <p role="status" className="text-xs text-muted-foreground">{t("正在读取换 IP 参数…")}</p>}
       {hookError && <div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-destructive">{t("无法读取已保存的换 IP 参数")}{onRetryHook && <Button type="button" size="sm" variant="outline" onClick={onRetryHook}>{t("重试")}</Button>}{onReplaceHook && <Button type="button" size="sm" variant="outline" onClick={onReplaceHook}>{t("重新配置接口")}</Button>}</div>}
       <fieldset disabled={hookLoading || hookError || value.hookConfigured && !value.hookLoaded} className="min-w-0 space-y-3 border-t pt-3 disabled:opacity-60">

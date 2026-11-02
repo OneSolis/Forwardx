@@ -44,7 +44,6 @@ export async function getProbeHealthViews(ids: number[]) {
   const rows = await queryRaw<any>(`SELECT h.*, s.${q("intervalSeconds")} AS ${q("intervalSeconds")} FROM ${q("host_probe_health")} h LEFT JOIN ${q("host_probe_services")} s ON s.${q("id")} = h.${q("serviceId")} WHERE h.${q("serviceId")} IN ${list.sql}`, list.params);
   const attempts = await queryRaw<any>(`SELECT a.* FROM ${q("host_ip_switch_attempts")} a WHERE a.${q("id")} IN (SELECT MAX(${q("id")}) FROM ${q("host_ip_switch_attempts")} WHERE ${q("serviceId")} IN ${list.sql} GROUP BY ${q("serviceId")})`, list.params);
   const hosts = inList([...new Set(rows.map(row => Number(row.hostId)))]);
-  const blocked = rows.length ? await queryRaw<any>(`SELECT a.* FROM ${q("host_ip_switch_attempts")} a WHERE a.${q("id")} IN (SELECT MAX(${q("id")}) FROM ${q("host_ip_switch_attempts")} WHERE ${q("hostId")} IN ${hosts.sql} AND ${q("status")} IN ('pending','uncertain') AND ${q("acknowledged")} = ${boolLiteral(false)} GROUP BY ${q("hostId")})`, hosts.params) : [];
   const cooldowns = rows.length ? await queryRaw<any>(`SELECT ${q("hostId")}, MAX(${q("cooldownUntil")}) AS ${q("nextAt")} FROM ${q("host_ip_switch_attempts")} WHERE ${q("hostId")} IN ${hosts.sql} GROUP BY ${q("hostId")}`, hosts.params) : [];
   const actionView = (item: any) => item ? { id: Number(item.id), status: item.status, reason: item.reason || null, httpStatus: item.httpStatus == null ? null : Number(item.httpStatus), newIp: item.newIp, createdAt: Number(item.createdAt), acknowledged: item.acknowledged === true || Number(item.acknowledged) === 1 } : null;
   return new Map(rows.map(row => {
@@ -54,7 +53,7 @@ export async function getProbeHealthViews(ids: number[]) {
       agentReady: ipSwitchAgentReady(Number(row.hostId)),
       nextSwitchAt: Number(cooldowns.find(item => Number(item.hostId) === Number(row.hostId))?.nextAt || state?.actionRetryAt || 0),
       state: state ? { ...state, stale: Date.now() / 1000 - state.lastSeen > Math.max(120, Number(row.intervalSeconds || 30) * 3) } : null,
-      lastAction: actionView(lastAction), blockedAction: actionView(blocked.find(item => Number(item.hostId) === Number(row.hostId))) }];
+      lastAction: actionView(lastAction), blockedAction: null }];
   }));
 }
 /** Called in the same transaction as service changes. Missing input preserves saved configuration. */
@@ -126,8 +125,6 @@ async function performSwitch(row: any, service: any, host: any, state: ChinaHeal
       if (!deps.ready(host.id)) return defer("agent_unavailable", "自动换 IP 等待中：Agent 未在线上报换 IP 能力，尚未请求商家接口");
       const [limits] = await queryRaw<any>(`SELECT COUNT(*) AS ${q("count")}, MIN(${q("createdAt")}) AS ${q("firstAt")} FROM ${q("host_ip_switch_attempts")} WHERE ${q("hostId")} = ? AND ${q("createdAt")} > ?`, [host.id, now - 86400]);
       const [latest] = await queryRaw<any>(`SELECT ${q("createdAt")}, ${q("finishedAt")}, ${q("cooldownUntil")} FROM ${q("host_ip_switch_attempts")} WHERE ${q("hostId")} = ? ORDER BY ${q("createdAt")} DESC, ${q("id")} DESC LIMIT 1`, [host.id]);
-      const unresolved = await queryRaw<any>(`SELECT ${q("id")} FROM ${q("host_ip_switch_attempts")} WHERE ${q("hostId")} = ? AND ${q("status")} IN ('pending','uncertain') AND ${q("acknowledged")} = ${boolLiteral(false)} LIMIT 1`, [host.id]);
-      if (unresolved.length) return defer("unresolved", "自动换 IP 已暂停：上次请求结果不明确，请先核对商家结果");
       // Measure the merchant interval from completion, not merely queueing.
       // History is host-wide, so editing/recreating services cannot bypass it.
       const nextAt = latest ? Math.max(Number(latest.cooldownUntil || 0), Math.max(Number(latest.createdAt), Number(latest.finishedAt || 0)) + config.cooldownSeconds) : 0;
@@ -147,7 +144,7 @@ async function performSwitch(row: any, service: any, host: any, state: ChinaHeal
       if (blockedMessage) await deps.notify(service, host, blockedMessage, config);
       return;
     }
-    let status = "uncertain", newIp: string | null = null, message = "换 IP 请求结果未确认，已停止自动重试，请核对商家结果";
+    let status = "uncertain", newIp: string | null = null, message = "换 IP 请求结果未确认，将在商家请求间隔后继续尝试";
     let reason: string = "request_failed", httpStatus: number | null = null;
     try {
       let hook: IpSwitchHook;
@@ -160,7 +157,7 @@ async function performSwitch(row: any, service: any, host: any, state: ChinaHeal
         throw new Error("not_executed");
       }
       if (response.outcome === "uncertain") {
-        message = `换 IP 请求结果未确认：${ipSwitchReasonMessage(response.reason)}${httpStatus ? `（HTTP ${httpStatus}）` : ""}；已停止自动重试，请核对商家结果`;
+        message = `换 IP 请求结果未确认：${ipSwitchReasonMessage(response.reason)}${httpStatus ? `（HTTP ${httpStatus}）` : ""}；将在商家请求间隔后继续尝试`;
       }
       newIp = await verifyIpSwitchResponse(hook, response, expectedIp);
       status = response.outcome === "accepted" ? "accepted" : "succeeded";
@@ -185,21 +182,22 @@ async function performSwitch(row: any, service: any, host: any, state: ChinaHeal
         message = `换 IP 任务未下发给 Agent：${ipSwitchReasonMessage(reason)}；尚未调用商家接口，后续仍遵循商家请求间隔`;
       } else if (status === "uncertain" && reason === "ok") {
         reason = newIp || (error instanceof Error && error.message === "provider_invalid_new_ip") ? "invalid_ip" : "success_mismatch";
-        message = `换 IP 请求结果未确认：${ipSwitchReasonMessage(reason)}；已停止自动重试，请核对商家结果`;
+        message = `换 IP 请求结果未确认：${ipSwitchReasonMessage(reason)}；将在商家请求间隔后继续尝试`;
       }
       // Neither exception messages nor response bodies are safe to log (URLs/headers may contain keys).
       // Even HTTP errors can follow a successful provider-side action: require operator verification.
     }
     const finishedAt = Math.max(now, Math.floor(Date.now() / 1000));
     await executeRaw(`UPDATE ${q("host_ip_switch_attempts")} SET ${q("status")} = ?, ${q("reason")} = ?, ${q("httpStatus")} = ?, ${q("newIp")} = ?, ${q("finishedAt")} = ?, ${q("cooldownUntil")} = ? WHERE ${q("id")} = ?`, [status, reason, httpStatus, newIp, finishedAt, finishedAt + config.cooldownSeconds, attemptId!]);
-    if (status === "not_executed") {
-      // A definite non-execution is safe to schedule again after the interval.
-      // Give it a fresh durable task ID; ambiguous/accepted requests NEVER retry.
+    {
+      // Allow another attempt after the merchant interval; the cooldown and
+      // daily limit below decide whether the next pass sends a request.
       await withKeyedTaskLock(probeHealthLock(service.id), async () => {
         const [current] = await queryRaw<any>(`SELECT ${q("state")} FROM ${q("host_probe_health")} WHERE ${q("id")} = ?`, [row.id]);
         const next = parseState(current?.state);
         if (next?.incidentId !== state.incidentId) return;
         next.actionAttempted = false; next.incidentId = randomUUID();
+        delete next.actionBlockedReason; delete next.actionRetryAt;
         await executeRaw(`UPDATE ${q("host_probe_health")} SET ${q("state")} = ? WHERE ${q("id")} = ?`, [JSON.stringify(next), row.id]);
       });
     }

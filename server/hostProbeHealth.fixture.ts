@@ -91,7 +91,7 @@ try {
   assert.equal(calls, 2); // Daily cap, including earlier accepted calls.
   assert.ok(notices > 0);
 
-  // Unknown result survives database reload/settings edits and blocks future paid calls.
+  // Unknown result survives database reload/settings edits; the provider interval governs the next attempt.
   const second = await admin.createProbeService({ ...serviceInput, name: "Uncertain", hostIds: [2] });
   const host2 = (await db.getHostById(2))!, report2 = { ...report, serviceId: second.id };
   let uncertainCalls = 0;
@@ -100,7 +100,7 @@ try {
   assert.equal((await getProbeHealthViews([second.id])).get(second.id).lastAction.status, "uncertain");
   await admin.updateProbeService({ ...serviceInput, hostIds: [2], id: second.id, health: { ...health, hook: undefined } });
   for (const offset of [500, 515, 530]) await observeProbeHealth(host2, [report2], base + offset, uncertainDeps);
-  assert.equal(uncertainCalls, 1);
+  assert.equal(uncertainCalls, 2);
   await runtime.executeRaw("UPDATE host_ip_switch_attempts SET createdAt = ? WHERE serviceId = ?", [base - 500, second.id]);
   await acknowledgeIpSwitch(second.id);
   assert.equal((await getProbeHealthViews([second.id])).get(second.id).lastAction.acknowledged, true);
@@ -121,11 +121,8 @@ try {
   assert.equal((await getProbeHealthViews([id])).has(id), false);
   await admin.deleteProbeService({ id: second.id });
   assert.equal((await getProbeHealthViews([second.id])).has(second.id), false);
-  assert.equal((await runtime.queryRaw<any>("SELECT COUNT(*) AS count FROM host_ip_switch_attempts WHERE serviceId = ?", [second.id]))[0].count, 1);
+  assert.equal((await runtime.queryRaw<any>("SELECT COUNT(*) AS count FROM host_ip_switch_attempts WHERE serviceId = ?", [second.id]))[0].count, 2);
   const replacement = await admin.createProbeService({ ...serviceInput, hostIds: [2] });
-  await runtime.executeRaw("UPDATE host_ip_switch_attempts SET acknowledged = 0 WHERE serviceId = ?", [second.id]);
-  assert.equal((await getProbeHealthViews([replacement.id])).get(replacement.id).blockedAction.status, "uncertain");
-  await acknowledgeIpSwitch(replacement.id);
   assert.equal((await getProbeHealthViews([replacement.id])).get(replacement.id).blockedAction, null);
 
   // Definite non-execution used to latch actionAttempted for the whole incident.
@@ -148,7 +145,7 @@ try {
   await observeProbeHealth(host6, [report6], base + 330, retryDeps);
   assert.equal(retryCalls, 2);
   for (const offset of [345, 1000, 1015, 1030]) await observeProbeHealth(host6, [report6], base + offset, retryDeps);
-  assert.equal(retryCalls, 2, "accepted calls never retry within the same unresolved incident");
+  assert.equal(retryCalls, 2, "the daily cap prevents another accepted attempt");
 
   // The original merchant interval remains host-wide after a shorter service
   // is added or settings are edited. Read durable history, not an in-memory timer.
@@ -177,7 +174,7 @@ try {
   });
   const rejectedView = (await getProbeHealthViews([rejected.id])).get(rejected.id);
   assert.equal(rejectedView.lastAction.status, "uncertain"); assert.equal(rejectedView.lastAction.reason, "http_status");
-  assert.equal(rejectedView.lastAction.httpStatus, 429); assert.ok(rejectedView.blockedAction);
+  assert.equal(rejectedView.lastAction.httpStatus, 429); assert.equal(rejectedView.blockedAction, null);
 
   // Invalid saved ciphertext fails before dispatch, not as an ambiguous paid call.
   const corrupt = await admin.createProbeService({ ...serviceInput, hostIds: [9] });

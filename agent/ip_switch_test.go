@@ -523,3 +523,56 @@ func TestIPSwitchPublicIPResponseFormats(t *testing.T) {
 		}
 	}
 }
+
+func TestIPSwitchResultReportRetriesTransientFailures(t *testing.T) {
+	task := sampleIPSwitchTask()
+	result := ipSwitchResult{TaskID: task.TaskID, Outcome: "accepted", Reason: "ok"}
+	attempts, sleeps := 0, 0
+	logged := captureIPSwitchLogs(t, func() {
+		reportIPSwitchResultWithRetry(task, result, func(_ ipSwitchResult, ack *ipSwitchReportAck) error {
+			attempts++
+			if attempts < 3 {
+				return context.DeadlineExceeded
+			}
+			ack.Success = true
+			return nil
+		}, func(delay time.Duration) {
+			sleeps++
+			if delay != ipSwitchReportRetryDelay {
+				t.Fatalf("unexpected retry delay: %s", delay)
+			}
+		}, time.Now().Add(time.Minute))
+	})
+	if attempts != 3 || sleeps != 2 {
+		t.Fatalf("attempts=%d sleeps=%d", attempts, sleeps)
+	}
+	for _, stage := range []string{"stage=result_report_retry", "stage=result_reported"} {
+		if !strings.Contains(logged, stage) {
+			t.Fatalf("missing %s: %s", stage, logged)
+		}
+	}
+}
+
+func TestIPSwitchResultReportStopsOnRejectionOrDeadline(t *testing.T) {
+	task := sampleIPSwitchTask()
+	result := ipSwitchResult{TaskID: task.TaskID, Outcome: "accepted", Reason: "ok"}
+	attempts := 0
+	logged := captureIPSwitchLogs(t, func() {
+		reportIPSwitchResultWithRetry(task, result, func(_ ipSwitchResult, ack *ipSwitchReportAck) error {
+			attempts++
+			ack.Success = false
+			return nil
+		}, func(time.Duration) { t.Fatal("rejected result must not sleep") }, time.Now().Add(time.Minute))
+	})
+	if attempts != 1 || !strings.Contains(logged, "stage=result_report_rejected") {
+		t.Fatalf("rejected result retried: %d %s", attempts, logged)
+	}
+	attempts = 0
+	reportIPSwitchResultWithRetry(task, result, func(_ ipSwitchResult, _ *ipSwitchReportAck) error {
+		attempts++
+		return context.DeadlineExceeded
+	}, func(time.Duration) { t.Fatal("expired window must not sleep") }, time.Now().Add(-time.Second))
+	if attempts != 1 {
+		t.Fatalf("deadline retried: %d", attempts)
+	}
+}
