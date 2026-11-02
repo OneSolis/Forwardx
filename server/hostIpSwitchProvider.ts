@@ -21,10 +21,16 @@ export function requestIpSwitch(hook: IpSwitchHook, context: IpSwitchContext): P
   });
 }
 export async function verifyIpSwitchResponse(hook: IpSwitchHook, response: IpSwitchAgentResult, oldIp: string) {
-  if (response.outcome !== (hook.successMode === "http" ? "accepted" : "verified")) throw new Error("provider_success_unconfirmed");
-  if (!hook.ipPath) return null;
-  const ip = response.newIp;
-  if (typeof ip !== "string" || !isIP(ip.trim()) || ip.trim() === oldIp) throw new Error("provider_invalid_new_ip");
-  await assertSafeOutboundHost(ip.trim(), { purpose: "新 IP" });
-  return ip.trim();
+  // HTTP-mode hooks may now be confirmed by the Agent public-IP probe after the
+  // request; JSON-mode hooks still require the provider success condition.
+  const outcomes = hook.successMode === "http" ? ["accepted", "verified"] : ["verified"];
+  if (!outcomes.includes(response.outcome)) throw new Error("provider_success_unconfirmed");
+  const ip = response.newIp?.trim();
+  if (!ip) {
+    if (hook.ipPath) throw new Error("provider_invalid_new_ip");
+    return null;
+  }
+  if (!isIP(ip) || ip === oldIp) throw new Error("provider_invalid_new_ip");
+  await assertSafeOutboundHost(ip, { purpose: "新 IP" });
+  return ip;
 }

@@ -20,6 +20,18 @@ import (
 	"time"
 )
 
+const (
+	// Give the provider-side change time to take effect before reading the
+	// public egress address. The panel sends expectedIp only when it accepts
+	// a verified outcome for HTTP-mode hooks; older panels keep the provider result.
+	ipSwitchVerifyDelay      = 10 * time.Second
+	ipSwitchVerifyTimeout    = 10 * time.Second
+	ipSwitchVerifyURL        = "https://ip.sb"
+	ipSwitchVerifyLimit      = 4096
+	ipSwitchReportRetryDelay = 5 * time.Second
+	ipSwitchReportWindow     = 55 * time.Second
+)
+
 type ipSwitchRequest struct {
 	URL            string            `json:"url"`
 	Method         string            `json:"method"`
@@ -32,10 +44,11 @@ type ipSwitchRequest struct {
 	TimeoutSeconds int               `json:"timeoutSeconds"`
 }
 type ipSwitchTask struct {
-	TaskID    string          `json:"taskId"`
-	ServiceID int             `json:"serviceId"`
-	ExpiresAt int64           `json:"expiresAt"`
-	Request   ipSwitchRequest `json:"request"`
+	TaskID     string          `json:"taskId"`
+	ServiceID  int             `json:"serviceId"`
+	ExpectedIP string          `json:"expectedIp,omitempty"`
+	ExpiresAt  int64           `json:"expiresAt"`
+	Request    ipSwitchRequest `json:"request"`
 }
 type ipSwitchResult struct {
 	TaskID     string `json:"taskId"`
@@ -223,6 +236,73 @@ func newIPSwitchClient(timeout time.Duration) *http.Client {
 	}
 	return &http.Client{Transport: transport, Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
+
+// parseIPSwitchPublicIP accepts the plain-text address ip.sb serves to curl
+// and the JSON form used by some mirrors.
+func parseIPSwitchPublicIP(body []byte) net.IP {
+	text := strings.TrimSpace(string(body))
+	if ip := net.ParseIP(text); ip != nil {
+		return ip
+	}
+	var data any
+	if json.Unmarshal(body, &data) == nil {
+		if value, ok := ipSwitchJSONValue(data, "ip").(string); ok {
+			return net.ParseIP(strings.TrimSpace(value))
+		}
+	}
+	return nil
+}
+
+// lookupIPSwitchPublicIP reads the public egress address of this Agent host.
+// The dedicated client keeps the same no-proxy, no-redirect and address rules
+// as the provider request client.
+// lookupIPSwitchPublicIP reads the public egress address, retrying briefly
+// because the provider may reset networking while applying the new address.
+func lookupIPSwitchPublicIP() (string, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		value, err := lookupIPSwitchPublicIPOnce()
+		if err == nil {
+			return value, nil
+		}
+		lastErr = err
+		if attempt < 2 {
+			time.Sleep(3 * time.Second)
+		}
+	}
+	return "", lastErr
+}
+
+func lookupIPSwitchPublicIPOnce() (string, error) {
+	client := newIPSwitchClient(ipSwitchVerifyTimeout)
+	defer client.CloseIdleConnections()
+	req, err := http.NewRequest(http.MethodGet, ipSwitchVerifyURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "text/plain")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", &ipSwitchTransportError{reason: "http_status"}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, ipSwitchVerifyLimit+1))
+	if err != nil {
+		return "", err
+	}
+	if len(body) > ipSwitchVerifyLimit {
+		return "", &ipSwitchTransportError{reason: "response_too_large"}
+	}
+	ip := parseIPSwitchPublicIP(body)
+	if ip == nil {
+		return "", &ipSwitchTransportError{reason: "invalid_response"}
+	}
+	return ip.String(), nil
+}
+
 func ipSwitchJSONValue(value any, path string) any {
 	for _, key := range strings.Split(path, ".") {
 		object, ok := value.(map[string]any)
@@ -336,6 +416,43 @@ func executeIPSwitchRequest(task ipSwitchTask, client *http.Client) (result ipSw
 	return result
 }
 
+// verifyIPSwitchNewIP waits for the provider-side change to settle and reads
+// the public egress address of the Agent host. It only runs when the panel sent
+// expectedIp, which also tells us the panel accepts a verified HTTP-mode result.
+//
+// A failed or unreadable lookup keeps the provider result: the paid request may
+// have succeeded, so a lookup problem must not turn it into an uncertain attempt.
+// A reachable lookup that still reports the old address does mark the attempt
+// uncertain, because the switch cannot be confirmed.
+func verifyIPSwitchNewIP(task ipSwitchTask, result ipSwitchResult, wait func(time.Duration), lookup func() (string, error)) ipSwitchResult {
+	if task.ExpectedIP == "" || (result.Outcome != "accepted" && result.Outcome != "verified") {
+		return result
+	}
+	logIPSwitchTask(task, "stage=verify_wait delaySeconds=%d 等待换 IP 生效后核对公网地址", int(ipSwitchVerifyDelay/time.Second))
+	wait(ipSwitchVerifyDelay)
+	observedText, err := lookup()
+	if err != nil {
+		logIPSwitchTask(task, "stage=verify_finished outcome=%s reason=%s diagnostic=verify_unavailable error=%s 无法读取公网地址，保留商家接口结果", result.Outcome, result.Reason, ipSwitchErrorCategory(err))
+		return result
+	}
+	observed := net.ParseIP(strings.TrimSpace(observedText))
+	if observed == nil || !allowedIPSwitchIP(observed) || observed.IsPrivate() {
+		logIPSwitchTask(task, "stage=verify_finished outcome=%s reason=%s diagnostic=verify_invalid_response 公网地址不可用，保留商家接口结果", result.Outcome, result.Reason)
+		return result
+	}
+	if expected := net.ParseIP(task.ExpectedIP); expected != nil && observed.Equal(expected) {
+		result.Outcome, result.Reason, result.NewIP = "uncertain", "invalid_ip", ""
+		logIPSwitchTask(task, "stage=verify_finished outcome=uncertain reason=invalid_ip diagnostic=verify_ip_unchanged 等待后公网地址未变化")
+		return result
+	}
+	if result.NewIP == "" {
+		result.NewIP = observed.String()
+	}
+	result.Outcome, result.Reason = "verified", "ok"
+	logIPSwitchTask(task, "stage=verify_finished outcome=verified reason=ok diagnostic=verify_ip_changed 已观察到新的公网地址")
+	return result
+}
+
 func runIPSwitchTask(task ipSwitchTask, directory string, now func() int64, claim func() bool, execute func(ipSwitchTask) ipSwitchResult) (result ipSwitchResult) {
 	result = ipSwitchResult{TaskID: task.TaskID, Outcome: "not_executed", Reason: "invalid_request"}
 	diagnostic, errorCategory, executing := "invalid_task_or_config", "none", false
@@ -418,27 +535,54 @@ func handleIPSwitchTask(cfg Config, task ipSwitchTask) {
 	}, func(task ipSwitchTask) ipSwitchResult {
 		client := newIPSwitchClient(time.Duration(task.Request.TimeoutSeconds) * time.Second)
 		defer client.CloseIdleConnections()
-		return executeIPSwitchRequest(task, client)
+		return verifyIPSwitchNewIP(task, executeIPSwitchRequest(task, client), time.Sleep, lookupIPSwitchPublicIP)
 	})
 	// Only fixed enums/IDs are logged; neither provider responses nor credentials.
 	logIPSwitchTask(task, "outcome=%s reason=%s status=%d durationMs=%d", result.Outcome, result.Reason, result.HTTPStatus, time.Since(started).Milliseconds())
-	reportIPSwitchResult(task, result, func(result ipSwitchResult, ack *ipSwitchReportAck) error {
+	panelNow := encryptedResponseNow(currentPanelURL(cfg))
+	reportDeadline := time.Now().Add(time.Unix(task.ExpiresAt, 0).Add(ipSwitchReportWindow).Sub(panelNow))
+	reportIPSwitchResultWithRetry(task, result, func(result ipSwitchResult, ack *ipSwitchReportAck) error {
 		return post(cfg, "/api/agent/ip-switch-result", map[string]any{"result": result}, ack)
-	})
+	}, time.Sleep, reportDeadline)
 }
 
 type ipSwitchReportAck struct {
 	Success bool `json:"success"`
 }
 
-func reportIPSwitchResult(task ipSwitchTask, result ipSwitchResult, report func(ipSwitchResult, *ipSwitchReportAck) error) {
+func reportIPSwitchResultAttempt(task ipSwitchTask, result ipSwitchResult, report func(ipSwitchResult, *ipSwitchReportAck) error) bool {
 	logIPSwitchTask(task, "stage=result_report_started 开始回传换 IP 结果")
 	var ack ipSwitchReportAck
 	if err := report(result, &ack); err != nil {
 		logIPSwitchTask(task, "stage=result_report_failed error=%s 换 IP 结果回传失败，不会重复请求商家接口", ipSwitchErrorCategory(err))
-	} else if !ack.Success {
+		return true
+	}
+	if !ack.Success {
 		logIPSwitchTask(task, "stage=result_report_rejected 面板未接收该结果，请检查任务是否过期或已结束；不会重复请求商家接口")
-	} else {
-		logIPSwitchTask(task, "stage=result_reported 换 IP 结果已回传面板")
+		return false
+	}
+	logIPSwitchTask(task, "stage=result_reported 换 IP 结果已回传面板")
+	return false
+}
+
+func reportIPSwitchResult(task ipSwitchTask, result ipSwitchResult, report func(ipSwitchResult, *ipSwitchReportAck) error) {
+	reportIPSwitchResultAttempt(task, result, report)
+}
+
+// The provider may reset networking while applying a new address, so the
+// result POST can fail after the paid request already succeeded. Retry only
+// the report until shortly before the panel stops accepting the result; a
+// rejected result is final because the panel no longer knows the task.
+func reportIPSwitchResultWithRetry(task ipSwitchTask, result ipSwitchResult, report func(ipSwitchResult, *ipSwitchReportAck) error, sleep func(time.Duration), deadline time.Time) {
+	for attempt := 1; ; attempt++ {
+		if !reportIPSwitchResultAttempt(task, result, report) {
+			return
+		}
+		if !time.Now().Add(ipSwitchReportRetryDelay).Before(deadline) {
+			logIPSwitchTask(task, "stage=result_report_failed attempts=%d 结果回传重试窗口结束，不会重复请求商家接口", attempt)
+			return
+		}
+		logIPSwitchTask(task, "stage=result_report_retry attempt=%d 面板连接暂不可用，等待后重试结果回传", attempt)
+		sleep(ipSwitchReportRetryDelay)
 	}
 }

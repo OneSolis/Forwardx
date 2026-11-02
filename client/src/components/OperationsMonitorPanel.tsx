@@ -1,12 +1,10 @@
 import { useState } from "react";
 import { trpc } from "@/lib/trpc";
 import { t, getFormatLocale } from "@/i18n";
-import { toast } from "@/lib/localizedToast";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { SlidingTabsList } from "@/components/ui/sliding-tabs";
-import { useConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Activity, ShieldCheck, RefreshCw } from "lucide-react";
 import { ipSwitchBlockedLabels, ipSwitchReasonLabels } from "@shared/hostChinaHealth";
 
@@ -18,12 +16,7 @@ const time = (value: unknown) => new Date(Number(value) * 1000).toLocaleString(g
 export default function OperationsMonitorPanel({ interval }: { interval: number | false }) {
   const [page, setPage] = useState(0), [ipPage, setIpPage] = useState(0);
   const [tab, setTab] = useState("resources");
-  const confirm = useConfirmDialog();
   const report = trpc.operations.monitor.useQuery({ page, ipPage }, { refetchInterval: interval, refetchIntervalInBackground: false, refetchOnWindowFocus: false });
-  const acknowledge = trpc.hosts.acknowledgeProbeHealthAction.useMutation({ onSuccess: () => { void report.refetch(); toast.success(t("已记录商家结果核对")); }, onError: error => toast.error(error.message) });
-  const acknowledgeAction = async (serviceId: number) => {
-    if (await confirm({ title: t("核对商家换 IP 结果"), description: t("请先在商家确认上次请求已结束。此操作只解除未知结果保护，不会重发上次请求；当前故障仍不会重复换 IP。"), confirmText: t("已核对，解除保护") })) acknowledge.mutate({ serviceId });
-  };
   const pagination = (current: number, total: number, onChange: (page: number) => void) => <div className="flex items-center justify-end gap-2 text-xs"><span>{t("共 {0} 条", [total])}</span><Button size="sm" variant="outline" disabled={current === 0 || report.isFetching} onClick={() => onChange(current - 1)}>{t("上一页")}</Button><Button size="sm" variant="outline" disabled={(current + 1) * 20 >= total || report.isFetching} onClick={() => onChange(current + 1)}>{t("下一页")}</Button></div>;
   return <Card><CardHeader><CardTitle className="flex items-center gap-2 text-base"><Activity className="size-4 text-emerald-500" />{t("状态与告警记录")}</CardTitle></CardHeader><CardContent className="space-y-4">
     {report.error && <p role="alert" className="text-sm text-destructive">{report.error.message}</p>}
@@ -40,10 +33,10 @@ export default function OperationsMonitorPanel({ interval }: { interval: number 
         <TabsContent value="health" className="space-y-3">
           {report.data.health.map(row => <div key={row.serviceId} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-3 text-sm"><div className="min-w-0"><p className="truncate">{row.hostName} · {row.name}</p><p className="mt-1 text-xs text-muted-foreground">{row.state?.lastSeen ? time(row.state.lastSeen) : "—"}</p>
             {row.isEnabled && row.autoSwitch && <div className="mt-1 space-y-1 text-xs text-muted-foreground">
-              {!row.agentReady ? <p className="text-amber-500">{t(ipSwitchBlockedLabels.agent_unavailable)}</p> : row.blockedAction ? <p className="text-amber-500">{t(ipSwitchBlockedLabels.unresolved)}</p> : row.state?.phase === "unhealthy" && row.state.actionBlockedReason && <p>{t(ipSwitchBlockedLabels[row.state.actionBlockedReason] || "等待自动换 IP")}</p>}
+              {!row.agentReady ? <p className="text-amber-500">{t(ipSwitchBlockedLabels.agent_unavailable)}</p> : row.state?.phase === "unhealthy" && row.state.actionBlockedReason && <p>{t(ipSwitchBlockedLabels[row.state.actionBlockedReason] || "等待自动换 IP")}</p>}
               {row.nextSwitchAt > Date.now() / 1000 && <p>{t("下次最早请求：{0}", [time(row.nextSwitchAt)])}</p>}
             </div>}
-          </div><span className={row.state?.phase === "unhealthy" ? "text-amber-500" : "text-muted-foreground"}>{!row.isEnabled ? t("已关闭") : row.state?.stale ? t("采样已过期") : t(healthNames[row.state?.phase || "unknown"] || "待检测")}</span>{row.blockedAction && <Button size="sm" variant="outline" disabled={acknowledge.isPending || Date.now() / 1000 - row.blockedAction.createdAt < 150} onClick={() => acknowledgeAction(row.serviceId)}>{t("已核对商家结果")}</Button>}</div>)}
+          </div><span className={row.state?.phase === "unhealthy" ? "text-amber-500" : "text-muted-foreground"}>{!row.isEnabled ? t("已关闭") : row.state?.stale ? t("采样已过期") : t(healthNames[row.state?.phase || "unknown"] || "待检测")}</span></div>)}
           {!report.data.health.length && <p className="py-3 text-xs text-muted-foreground">{t("暂无数据")}</p>}
         </TabsContent>
         <TabsContent value="ip" className="space-y-3">

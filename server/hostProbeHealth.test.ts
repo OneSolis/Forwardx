@@ -103,6 +103,7 @@ test("IP tasks are bound to one capable host, delivered and claimed at most once
   assert.deepEqual(takeIpSwitchAgentTasks(hostId + 1), []);
   const [task] = takeIpSwitchAgentTasks(hostId);
   assert.ok(task.request.url.includes("ip=2001%3A4860%3A4860%3A%3A8888"));
+  assert.equal(task.expectedIp, context.ip);
   assert.deepEqual(takeIpSwitchAgentTasks(hostId), []);
   assert.equal(await claimIpSwitchAgentTask(hostId + 1, task.taskId, async () => true), false);
   assert.equal(completeIpSwitchAgentTask(hostId, { taskId: task.taskId, outcome: "accepted", reason: "ok" }), false);
@@ -130,6 +131,15 @@ test("only explicit provider success and a different public address permit panel
   assert.equal(await verifyIpSwitchResponse(hook, result, "1.1.1.1"), "8.8.4.4");
   await assert.rejects(verifyIpSwitchResponse(hook, { ...result, outcome: "accepted" }, "1.1.1.1"));
   for (const newIp of ["1.1.1.1", "10.0.0.2", "127.0.0.1", "not-an-ip"]) await assert.rejects(verifyIpSwitchResponse(hook, { ...result, newIp }, "1.1.1.1"));
+});
+
+test("HTTP-mode hooks accept an Agent-verified public address without a provider IP path", async () => {
+  const hook = ipSwitchHookSchema.parse({ url: "http://10.0.0.1/changeip", successMode: "http" });
+  const result = { taskId: randomUUID(), outcome: "verified" as const, reason: "ok" as const, newIp: "8.8.4.4" };
+  assert.equal(await verifyIpSwitchResponse(hook, result, "1.1.1.1"), "8.8.4.4");
+  assert.equal(await verifyIpSwitchResponse(hook, { ...result, newIp: undefined }, "1.1.1.1"), null);
+  await assert.rejects(verifyIpSwitchResponse(hook, { ...result, newIp: "1.1.1.1" }, "1.1.1.1"), /provider_invalid_new_ip/);
+  await assert.rejects(verifyIpSwitchResponse(hook, { ...result, newIp: "10.0.0.2" }, "1.1.1.1"));
 });
 
 test("SQLite permissions, encrypted configuration, automatic actions, safeguards and cleanup", () => {
